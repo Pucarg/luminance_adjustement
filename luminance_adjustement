@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""Adjust image shadows or highlights using a clicked reference pixel.
+
+Edit USER CONFIGURATION below, then run: python adjust_luminance.py
+A desktop Matplotlib window is required; no Jupyter notebook is needed.
+"""
+
+from pathlib import Path
+import sys
+
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image, ImageOps
+
+
+# =============================================================================
+# USER CONFIGURATION -- edit these settings before running the script.
+# =============================================================================
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# USER: Folder containing your source images. Relative paths below are anchored
+# to this script, so running it from another working directory also works.
+# For an absolute Windows folder, use e.g. Path(r"C:\Users\YourName\Pictures").
+INPUT_DIR = SCRIPT_DIR / "Imagenes_referencia"
+
+# USER: Source filename, including its extension. Put your own image in INPUT_DIR.
+INPUT_FILENAME = "Huerto1.jpg"
+
+# USER: Destination folder. It is created automatically when saving an image.
+OUTPUT_DIR = SCRIPT_DIR / "Imagenes_resultantes"
+
+# USER: Output filename, e.g. "Huerto1_adjusted.png" or "Huerto1_adjusted.jpg".
+# Leave None to enter the name in the terminal after viewing the result.
+# A filename without an extension is saved as JPEG (.jpg).
+OUTPUT_FILENAME = None
+
+# USER: Choose which pixels to adjust relative to the clicked reference:
+# "shadows"    -> pixels BELOW the reference (the original notebook behavior).
+# "highlights" -> pixels ABOVE the reference (an additional mode).
+MODE = "shadows"
+
+# USER: Tone-curve strength, NOT a direct brightness multiplier.
+# In BOTH modes: k > 0 brightens, k < 0 darkens, and k = 0 makes no change.
+# Suggested starting points:
+#   MODE = "shadows",    K_VALUE =  3.25 -> brighten dark areas.
+#   MODE = "shadows",    K_VALUE = -3.25 -> darken dark areas.
+#   MODE = "highlights", K_VALUE = -3.25 -> darken bright areas.
+#   MODE = "highlights", K_VALUE =  3.25 -> brighten bright areas.
+K_VALUE = 3.25
+
+# USER: Set False if you only want to preview the result without saving it.
+SAVE_RESULT = True
+# =============================================================================
+
+
+def load_rgb_image(path):
+    """Read a photograph as an RGB float32 array with values in [0, 1]."""
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Input image not found: {path}\n"
+            "Edit INPUT_DIR and INPUT_FILENAME in USER CONFIGURATION."
+        )
+
+    with Image.open(path) as source:
+        # Honor camera/phone orientation before displaying and selecting pixels.
+        oriented = ImageOps.exif_transpose(source)
+        # Work with three 8-bit RGB channels, including for grayscale inputs.
+        # Transparency and original image metadata are not retained.
+        rgb = oriented.convert("RGB")
+        return np.asarray(rgb, dtype=np.float32) / 255.0
+
+
+def calculate_luminance(image):
+    """Return the notebook's approximate brightness map in [0, 1].
+
+    These weights are applied directly to encoded RGB values, without sRGB
+    linearization. The result is an approximate luma, not physical luminance.
+    """
+    return (
+        0.2126 * image[..., 0]
+        + 0.7152 * image[..., 1]
+        + 0.0722 * image[..., 2]
+    )
+
+
+def tone_curve(b, b0, k, mode="shadows"):
+    """Map brightness values using a normalized exponential curve.
+
+    b: scalar or NumPy array of brightness values in [0, 1].
+    b0: reference brightness selected by clicking the source image.
+    k: signed curve strength; positive brightens and negative darkens.
+    mode: "shadows" changes b < b0; "highlights" changes b > b0.
+
+    The reference and the endpoints of the selected interval stay unchanged.
+    All pixels outside that interval are copied without modification.
+    """
+    if mode not in {"shadows", "highlights"}:
+        raise ValueError('MODE must be "shadows" or "highlights".')
+    if b0 is None or not np.isfinite(b0) or not 0.0 <= b0 <= 1.0:
+        raise ValueError("Reference brightness must be between 0 and 1.")
+    if not np.isfinite(k):
+        raise ValueError("K_VALUE must be a finite number.")
+
+    values = np.asarray(b, dtype=np.float32)
+    mapped = values.copy()
+    if k == 0.0:
+        # This is the limit of the original expression as k tends to zero.
+        return mapped
+
+    if mode == "shadows":
+        lower, width = 0.0, float(b0)
+        mask = values < b0
+    else:
+        lower, width = float(b0), 1.0 - float(b0)
+        mask = values > b0
+
+    # Selecting black in shadows mode, or white in highlights mode, leaves no
+    # interval to modify. The same applies if no pixels meet the threshold.
+    if width <= 0.0 or not np.any(mask):
+        return mapped
+
+    # Normalize the affected interval to [0, 1]. Use float64 internally to keep
+    # the curve accurate for very small nonzero strengths.
+    t = (values[mask].astype(np.float64) - lower) / width
+    t = np.clip(t, 0.0, 1.0)
+    strength = abs(float(k))
+
+    # For k > 0, this is the notebook's curve:
+    # g(t) = (1 - exp(-k*t)) / (1 - exp(-k)).
+    # expm1 avoids cancellation when k is close to zero. For negative k, an
+    # algebraically equivalent form avoids overflowing positive exponentials.
+    g = -np.expm1(-strength * t) / -np.expm1(-strength)
+    if k < 0.0:
+        g *= np.exp(-strength * (1.0 - t))
+
+    mapped[mask] = lower + width * g
+    return mapped
+
+
+def apply_luminance_mapping(image, original_luminance, target_luminance):
+    """Scale all RGB channels equally and return (image, clipped_pixel_count)."""
+    scale = np.ones_like(original_luminance)
+    # Divide only nonblack pixels. Unlike adding epsilon to the denominator,
+    # this leaves unaffected pixels exactly unchanged, including when k = 0.
+    # Pure black remains black because its RGB channels contain no signal.
+    np.divide(
+        target_luminance,
+        original_luminance,
+        out=scale,
+        where=original_luminance > 0.0,
+    )
+    scaled = image * scale[..., np.newaxis]
+    clipped_pixels = int(np.count_nonzero(np.any(scaled > 1.0, axis=-1)))
+
+    # Brightening can push a channel above 1. Clipping keeps valid RGB values,
+    # but may change color and prevent the exact target luma from being reached.
+    return np.clip(scaled, 0.0, 1.0), clipped_pixels
+
+
+def select_reference_pixel(image, luminance):
+    """Show the source and brightness map; return the last clicked reference."""
+    backend = str(plt.get_backend()).lower()
+    if backend in {"agg", "cairo", "pdf", "pgf", "ps", "svg", "template"} or (
+        "matplotlib_inline" in backend
+    ):
+        raise RuntimeError(
+            "An interactive desktop Matplotlib backend is required. "
+            "Run this script locally with Tk or Qt support; see README.md."
+        )
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6), constrained_layout=True)
+    image_axis, map_axis = axes
+    image_axis.imshow(image)
+    image_axis.set_title("Click a reference pixel in this image")
+    image_axis.axis("off")
+    brightness_plot = map_axis.imshow(luminance, cmap="gray", vmin=0, vmax=1)
+    map_axis.set_title("Original approximate luminance")
+    map_axis.axis("off")
+    fig.colorbar(brightness_plot, ax=map_axis, shrink=0.8)
+    fig.suptitle("Click the image; press Enter or close the window to confirm. Esc cancels.")
+
+    selection = {"b0": None, "position": None, "marker": None}
+
+    def onclick(event):
+        # Ignore other axes, right clicks, and clicks used for pan/zoom tools.
+        if event.inaxes is not image_axis or event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        toolbar = getattr(fig.canvas.manager, "toolbar", None)
+        if toolbar is not None and toolbar.mode:
+            return
+
+        x, y = int(round(event.xdata)), int(round(event.ydata))
+        height, width = luminance.shape
+        if not (0 <= x < width and 0 <= y < height):
+            return
+
+        selection["b0"] = float(luminance[y, x])
+        selection["position"] = (x, y)
+        if selection["marker"] is not None:
+            selection["marker"].remove()
+        selection["marker"] = image_axis.scatter(
+            x, y, s=80, facecolors="none", edgecolors="red", linewidths=2
+        )
+        image_axis.set_title(
+            f"Reference ({x}, {y}): L = {selection['b0']:.4f}"
+        )
+        fig.canvas.draw_idle()
+        print(f"Selected pixel: x={x}, y={y}, reference L={selection['b0']:.4f}")
+
+    def onkey(event):
+        if event.key == "escape":
+            selection["b0"] = None
+            plt.close(fig)
+        elif event.key == "enter" and selection["b0"] is not None:
+            plt.close(fig)
+
+    # Register each callback once; no global variables or notebook state needed.
+    click_id = fig.canvas.mpl_connect("button_press_event", onclick)
+    key_id = fig.canvas.mpl_connect("key_press_event", onkey)
+    try:
+        plt.show(block=True)
+    finally:
+        fig.canvas.mpl_disconnect(click_id)
+        fig.canvas.mpl_disconnect(key_id)
+
+    if selection["b0"] is None:
+        return None
+    return selection["b0"], selection["position"]
+
+
+def show_results(original, modified, actual_luminance, b0, k, mode):
+    """Display the comparison, target tone curve, and actual output luma."""
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9), constrained_layout=True)
+    axes[0, 0].imshow(original)
+    axes[0, 0].set_title("Original")
+    axes[0, 0].axis("off")
+    axes[0, 1].imshow(modified)
+    axes[0, 1].set_title(f"Modified: {mode}, k={k:g}")
+    axes[0, 1].axis("off")
+
+    b = np.linspace(0.0, 1.0, 1000, dtype=np.float32)
+    curve_axis = axes[1, 0]
+    curve_axis.plot(b, b, "--", label="No change")
+    curve_axis.plot(b, tone_curve(b, b0, k, mode), label=f"Target curve (k={k:g})")
+    curve_axis.axvline(b0, linestyle=":", color="gray", label=f"Reference = {b0:.3f}")
+    curve_axis.set(
+        title="Brightness mapping",
+        xlabel="Original brightness",
+        ylabel="Target brightness",
+        xlim=(0, 1),
+        ylim=(0, 1),
+    )
+    curve_axis.grid(True, alpha=0.3)
+    curve_axis.legend()
+
+    # Recomputed from the clipped RGB result, rather than displaying the ideal
+    # target map, which can differ from the image when color channels saturate.
+    brightness_plot = axes[1, 1].imshow(
+        actual_luminance, cmap="gray", vmin=0, vmax=1
+    )
+    axes[1, 1].set_title("Output approximate luminance (after RGB clipping)")
+    axes[1, 1].axis("off")
+    fig.colorbar(brightness_plot, ax=axes[1, 1], shrink=0.8)
+    fig.suptitle("Review the result, then close this window to continue.")
+    plt.show(block=True)
+
+
+def save_image(image, input_path, output_dir, output_filename):
+    """Save an 8-bit RGB PNG/JPEG, optionally asking for a filename."""
+    if output_filename is None:
+        output_filename = input(
+            "Output filename (.png/.jpg/.jpeg; no extension = .jpg; "
+            "leave blank to skip saving): "
+        )
+    filename = str(output_filename).strip()
+    if not filename:
+        print("Saving skipped.")
+        return None
+    if filename in {".", ".."} or Path(filename).name != filename:
+        raise ValueError("Use a filename only; configure its folder with OUTPUT_DIR.")
+
+    output_path = Path(output_dir) / filename
+    if not output_path.suffix:
+        output_path = output_path.with_suffix(".jpg")
+    suffix = output_path.suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg"}:
+        raise ValueError("Output extension must be .png, .jpg, or .jpeg.")
+    if output_path.resolve() == input_path.resolve():
+        raise ValueError("Choose an output path different from the source image.")
+    if output_path.exists():
+        raise FileExistsError(f"Output already exists; choose a new name: {output_path}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pixels = np.rint(np.clip(image, 0.0, 1.0) * 255.0).astype(np.uint8)
+    result = Image.fromarray(pixels)
+    # Exclusive creation also protects an existing output from accidental reuse.
+    with output_path.open("xb") as destination:
+        if suffix == ".png":
+            result.save(destination, format="PNG")
+        else:
+            result.save(destination, format="JPEG", quality=95)
+    print(f"Image saved to: {output_path}")
+    return output_path
+
+
+def main():
+    """Run loading, interactive selection, tone mapping, preview, and saving."""
+    # Validate the editable adjustment settings before opening any windows.
+    tone_curve(np.array([0.5], dtype=np.float32), 0.5, K_VALUE, MODE)
+    input_path = Path(INPUT_DIR) / INPUT_FILENAME
+    image = load_rgb_image(input_path)
+    luminance = calculate_luminance(image)
+    print(f"Loaded: {input_path} ({image.shape[1]} x {image.shape[0]} pixels)")
+    print(f"Adjustment: {MODE}, k={K_VALUE:g}")
+    print("Click the original image, then press Enter or close its window.")
+
+    selection = select_reference_pixel(image, luminance)
+    if selection is None:
+        print("No reference selected. Processing cancelled.")
+        return
+    b0, position = selection
+    target_luminance = tone_curve(luminance, b0, K_VALUE, MODE)
+    modified, clipped_pixels = apply_luminance_mapping(
+        image, luminance, target_luminance
+    )
+    actual_luminance = calculate_luminance(modified)
+    print(f"Reference: {position}, L={b0:.4f}")
+    print(f"Pixels with an RGB channel clipped to 1: {clipped_pixels}")
+    print("Close the results window to continue to saving.")
+    show_results(image, modified, actual_luminance, b0, K_VALUE, MODE)
+
+    if SAVE_RESULT:
+        save_image(modified, input_path, OUTPUT_DIR, OUTPUT_FILENAME)
+    else:
+        print("Saving disabled: SAVE_RESULT = False.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nCancelled by user.")
+        sys.exit(130)
+    except (OSError, ValueError, RuntimeError, EOFError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
